@@ -57,11 +57,9 @@ egc init             # asks for a name, then makes .<name> (hidden) and <name>
 egc init photos      # .photos, encrypted, and photos, where it opens
 ```
 
-Enter at the name takes the default, `vault` unless you set another. gocryptfs
-then asks for the new password twice and prints the vault's master key once:
-write it down, it is the only way back in if you forget the password. A gocryptfs folder made before egc
-works too once it is named `.<name>`, which is safe while it is locked because
-gocryptfs never records its own folder's name.
+gocryptfs asks for the new password twice and prints the vault's master key
+once: write it down, because it is the only way back in if you forget the
+password.
 
 ## Keep track of every vault
 
@@ -84,14 +82,26 @@ egc init --dir ~/drive     # make the vault somewhere else
 ```
 
 Every command that changes something takes `-n` to print what it would do
-instead; `egc <command> --help` has the rest.
+instead, and `egc <command> --help` has the details.
+
+Output is for people, errors go to stderr, and a failure exits 1. gocryptfs
+reads the password from the terminal, or one line from stdin when it is piped,
+so a script can unlock too.
 
 ## Where it keeps things
 
-Both live in `~/.config/egc/`, or `$XDG_CONFIG_HOME/egc/` when that is set:
+```
+~/.config/egc/vaults      the list egc ls shows, one vault per line
+~/.config/egc/settings    name = vault, the name egc init offers
+```
 
-- `vaults`: the list `egc ls` shows, one vault per line.
-- `settings`: `name = vault`, the name `egc init` offers.
+`$XDG_CONFIG_HOME/egc/` takes the place of `~/.config/egc/` when it is set.
+
+## Notes
+
+- A gocryptfs folder made before egc works too once it is named `.<name>`,
+  which is safe while it is locked because gocryptfs never records its own
+  folder's name.
 
 ## Compatibility
 

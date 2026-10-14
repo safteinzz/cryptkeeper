@@ -1,6 +1,6 @@
 [package]
 name = "easygocryptfs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "gocryptfs without the flags - lock and unlock encrypted folders from wherever you stand"

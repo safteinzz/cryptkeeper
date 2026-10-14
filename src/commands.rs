@@ -104,6 +104,12 @@ pub fn unlock(path: Option<PathBuf>, minutes: Option<u32>, dry: bool) -> Result<
         }
         let mut cmd = Command::new("gocryptfs");
         cmd.arg("-q");
+        // With no syslog to hand its messages to, the mount prints a "Unix syslog
+        // delivery error" per stream and then drops every later warning, a
+        // corrupt block included; `-nosyslog` keeps them on this terminal.
+        if !Path::new("/dev/log").exists() {
+            cmd.arg("-nosyslog");
+        }
         if let Some(m) = minutes {
             cmd.args(["-i", &format!("{m}m")]);
         }

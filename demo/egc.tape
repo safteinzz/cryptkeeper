@@ -1,7 +1,7 @@
 # The whole tool in one story: make a vault, open it, put a file in, lock it,
 # and see the file gone from view and only ciphertext left in `.photos`.
 #
-#   cargo build --release && cd demo && vhs egc.tape && ./stage.sh down
+#   cd demo && ./render.sh egc
 #
 # The vault is real and really mounted inside the stage; its password `demo`
 # and its master key die with the stage.
@@ -12,6 +12,8 @@ Set Shell bash
 Set FontFamily "JetBrainsMono NF"
 Set Theme "Catppuccin Mocha"
 Set FontSize 15
+# 1000 wide, not 1240: the widest line, gocryptfs's own note under the master
+# key, is under 80 columns, so 1240 would leave a quarter of the frame empty.
 Set Width 1000
 Set Height 420
 Set Padding 20

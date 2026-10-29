@@ -113,7 +113,12 @@ fn print_script(shell: Shell) -> Result<()> {
         &completer.to_string_lossy(),
         &mut out,
     )?;
-    std::io::stdout().write_all(&out)?;
+    // A reader that went away (`| head`) has all it wanted.
+    if let Err(e) = std::io::stdout().write_all(&out)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        anyhow::bail!("could not print the completion script");
+    }
     Ok(())
 }
 

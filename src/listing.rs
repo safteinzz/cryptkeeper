@@ -45,7 +45,9 @@ pub fn of_vault(v: &Vault, listed: bool) -> Entry {
     let open = matches!(state, "open" | "dead" | "exposed");
     let at = match v.kind {
         _ if !open => None,
-        Kind::Gocryptfs => Some(v.view.clone()),
+        Kind::Gocryptfs => {
+            Some(crate::gocryptfs::open_elsewhere(v).unwrap_or_else(|| v.view.clone()))
+        }
         Kind::Luks => luks::open_at(v),
         Kind::Age => age::open_at(v),
     };

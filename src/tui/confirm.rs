@@ -1,6 +1,6 @@
-//! The Yes/No boxes: the red gate in front of what drops something, starting
-//! on No so a reflex Enter never fires it, and the cyan offer of a fix,
-//! starting on Yes.
+//! The boxes that ask first: the cyan offer of a fix, two buttons starting
+//! on Yes, and the red typed gates in front of what cannot come back
+//! (deleting a vault, wiping a drive), where Enter waits for the short name.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -142,11 +142,13 @@ impl Typed {
     /// short name of what goes: a LUKS vault's image file, else the name the
     /// list shows.
     pub(super) fn delete(e: &Entry) -> Typed {
-        let gone = match e.kind {
+        // The body names what is removed in full; the field takes the short
+        // name the list shows (a LUKS image by its file).
+        let gone = &e.cipher;
+        let name = crate::vault::file_name(match e.kind {
             Kind::Luks => &e.cipher,
             _ => &e.name,
-        };
-        let name = crate::vault::file_name(gone);
+        });
         Typed {
             title: "delete vault".into(),
             message: format!(

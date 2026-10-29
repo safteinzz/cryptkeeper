@@ -383,8 +383,8 @@ const HELP: &[HelpSection] = &[
             ),
             ("p", "change its password (ck passwd)"),
             ("b", "save its gocryptfs.conf or LUKS header (ck backup)"),
-            ("c", "create: a new encrypted folder, an encrypted file,"),
-            ("", "  or a vault that exists added to the list"),
+            ("c", "create: an encrypted file, folder, drive or image,"),
+            ("", "  or list a vault you already have"),
             (
                 "e",
                 "edit an encrypted file in $VISUAL or $EDITOR (files only)",
@@ -402,11 +402,11 @@ const HELP: &[HelpSection] = &[
             ),
             (
                 "",
-                "found on this machine: gocryptfs folders and age files in",
+                "found on this machine: gocryptfs folders, age files and LUKS",
             ),
             (
                 "",
-                "  home, open gocryptfs and LUKS drives the list does not hold,",
+                "  images in home, open gocryptfs and LUKS drives not listed,",
             ),
             ("", "  `a` adds one to the list, opening nothing"),
             ("", "ck locks a drive only when its own unlock opened it"),
@@ -427,10 +427,7 @@ const HELP: &[HelpSection] = &[
         &[
             ("↵", "step a picked setting, or type a new value"),
             ("d", "put it back as ck ships it"),
-            (
-                "",
-                "every change is saved at once, to ~/.config/cryptkeeper/settings",
-            ),
+            ("", "every change is saved at once, to ck's settings file"),
         ],
     ),
     (

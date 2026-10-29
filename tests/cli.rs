@@ -81,7 +81,11 @@ fn stdout(out: &Output) -> String {
 /// A folder that passes for a gocryptfs vault's encrypted half.
 fn fake_gocryptfs(cipher: &Path) {
     fs::create_dir_all(cipher).unwrap();
-    fs::write(cipher.join("gocryptfs.conf"), "{}").unwrap();
+    fs::write(
+        cipher.join("gocryptfs.conf"),
+        r#"{"EncryptedKey": "not-a-real-key", "Version": 2}"#,
+    )
+    .unwrap();
 }
 
 fn list_of(lines: &[(&Path, &Path)]) -> String {
@@ -477,4 +481,99 @@ fn delete_takes_only_the_vault_named_never_one_found_walking_up() {
     let named = s.ck(&["delete", s.work().join("photos").to_str().unwrap(), "--yes"]);
     assert!(named.status.success(), "naming the vault itself deletes it");
     assert!(!cipher.exists(), "its encrypted folder is gone");
+}
+
+#[test]
+fn delete_leaves_a_folder_alone_that_only_holds_a_stray_gocryptfs_conf() {
+    let s = Sandbox::new("stray-conf");
+    let docs = s.work().join("docs");
+    fs::create_dir_all(&docs).unwrap();
+    fs::write(docs.join("thesis.txt"), "mine").unwrap();
+    fs::write(docs.join("gocryptfs.conf"), "{}").unwrap();
+
+    let out = s.ck(&["delete", docs.to_str().unwrap(), "--yes"]);
+    assert!(
+        !out.status.success(),
+        "a folder that is not a vault must not be deleted"
+    );
+    assert!(
+        docs.join("thesis.txt").exists(),
+        "the files in it are still there"
+    );
+}
+
+#[test]
+fn delete_leaves_a_listed_path_alone_once_its_file_is_no_vault() {
+    let s = Sandbox::new("stale-line");
+    let file = s.work().join("disk.img");
+    fs::write(&file, "a holiday video").unwrap();
+    fs::create_dir_all(s.list().parent().unwrap()).unwrap();
+    fs::write(s.list(), format!("luks\t{}\t\n", file.display())).unwrap();
+
+    let out = s.ck(&["delete", file.to_str().unwrap(), "--yes"]);
+    assert!(
+        !out.status.success(),
+        "a file that is no LUKS image must not be deleted"
+    );
+    assert!(file.exists(), "the file is still there");
+}
+
+#[test]
+fn a_vault_list_kept_as_a_link_is_written_where_it_points_and_kept_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Sandbox::new("linked-list");
+    let real = s.home().join("dots/vaults");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    fs::write(&real, "").unwrap();
+    fs::create_dir_all(s.list().parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, s.list()).unwrap();
+    fake_gocryptfs(&s.work().join(".photos"));
+
+    let out = s.ck(&["add", s.work().join("photos").to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(s.list())
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the link must stay a link"
+    );
+    let saved = fs::read_to_string(&real).unwrap();
+    assert!(
+        saved.contains(".photos"),
+        "the file it points to holds the vault, got:\n{saved}"
+    );
+    let mode = fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the list is readable by its owner only");
+}
+
+#[test]
+fn output_into_a_closed_pipe_exits_cleanly_instead_of_panicking() {
+    let s = Sandbox::new("closed-pipe");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let out = Command::new(env!("CARGO_BIN_EXE_ck"))
+        .args(["ls", "--json"])
+        .current_dir(s.work())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", s.home())
+        .env("XDG_CONFIG_HOME", s.home().join(".config"))
+        .env("XDG_STATE_HOME", s.home().join(".local/state"))
+        .env("XDG_RUNTIME_DIR", s.root.join("run"))
+        .stdin(Stdio::null())
+        .stdout(writer)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "ck panicked: {stderr}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a reader that went away is no failure"
+    );
 }

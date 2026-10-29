@@ -385,7 +385,15 @@ pub fn lock(v: &Vault, dry: bool) -> Result<()> {
 /// Drops the line for `uuid`, a device found locked, so if something else
 /// opens it later this boot, ck never takes it for its own.
 fn forget_stale(records: &mut Records, uuid: &str) -> Result<()> {
-    if records.has(uuid) {
+    // A copy of an image shares its UUID, so a line still serving an unlocked
+    // device belongs to the original and stays.
+    let serving = match records.made_loop(uuid) {
+        Some(l) => cleartext(&l).is_some(),
+        None => fs::canonicalize(by_uuid(uuid))
+            .ok()
+            .is_some_and(|d| cleartext(&file_name(&d)).is_some()),
+    };
+    if records.has(uuid) && !serving {
         records.remove(uuid);
         records.save()?;
     }
@@ -478,9 +486,14 @@ fn sudo_mount(v: &Vault, clear: &str) -> Result<PathBuf> {
     let record = wait_for(|| udev_record(clear).filter(|r| udev_value(r, "ID_FS_TYPE").is_some()))
         .unwrap_or_default();
     let fs_type = udev_value(&record, "ID_FS_TYPE").unwrap_or("").to_string();
+    // A label is only a folder name when it is a plain one: `.`, `..` or a
+    // hidden name would mount over the media folder itself or out of sight.
     let label = ["ID_FS_LABEL", "ID_FS_UUID"]
         .into_iter()
-        .find_map(|k| udev_value(&record, k).filter(|l| !l.is_empty() && !l.contains('/')))
+        .find_map(|k| {
+            udev_value(&record, k)
+                .filter(|l| !l.is_empty() && !l.contains('/') && !l.starts_with('.'))
+        })
         .unwrap_or(clear)
         .to_string();
     let point = media_dir().join(label);
@@ -547,7 +560,8 @@ fn sudo_lock(v: &Vault, clear: &str, facts: &Facts) -> Result<()> {
         bail!("could not lock `{}`{said}", tilde(&v.shown()));
     }
     for point in &facts.mounts {
-        if point.starts_with(media_dir()) {
+        // Only a folder `sudo_mount` made, never the media folder itself.
+        if point.parent() == Some(media_dir().as_path()) {
             let _ = run::foreground(Command::new("sudo").arg("rmdir").arg(point));
         }
     }
@@ -627,6 +641,15 @@ pub fn parse_size(text: &str) -> Option<u64> {
 fn in_use(name: &str) -> Option<String> {
     if name.starts_with("dm-") {
         return Some("it is the unlocked side of another device, not a drive".into());
+    }
+    // A partition shares its disk's fate: beside one in use (the system's own,
+    // say), it is the ESP or a recovery partition mounted only on demand.
+    if sys(name, "partition").is_some()
+        && let Some(sibling) = siblings(name).into_iter().find(|p| busy(p))
+    {
+        return Some(format!(
+            "it shares a disk with `/dev/{sibling}`, which is in use"
+        ));
     }
     if sys(name, "ro").as_deref() == Some("1") {
         return Some("it is read-only".into());
@@ -711,6 +734,35 @@ fn bytes(name: &str) -> Option<u64> {
         .parse::<u64>()
         .ok()
         .map(|sectors| sectors * 512)
+}
+
+/// The other partitions on the disk partition `name` is on.
+fn siblings(name: &str) -> Vec<String> {
+    let Some(disk) = fs::canonicalize(Path::new("/sys/class/block").join(name))
+        .ok()
+        .and_then(|p| p.parent().map(file_name))
+    else {
+        return Vec::new();
+    };
+    fs::read_dir(Path::new("/sys/class/block").join(&disk))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| *n != name && n.starts_with(&disk) && sys(n, "partition").is_some())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether partition `name` is in use: held (unlocked, LVM, RAID), mounted or swap.
+fn busy(name: &str) -> bool {
+    let held = fs::read_dir(Path::new("/sys/class/block").join(name).join("holders"))
+        .is_ok_and(|mut h| h.next().is_some());
+    let swaps = fs::read_to_string("/proc/swaps").unwrap_or_default();
+    held || !points_of(name).is_empty()
+        || swaps
+            .lines()
+            .any(|l| l.split_whitespace().next() == Some(&format!("/dev/{name}")))
 }
 
 /// Makes a LUKS vault at `path`: a new image file of `size` bytes, or with
@@ -935,7 +987,7 @@ fn explain_prompts(unlocking: bool) {
     let (passphrase, steps) = match unlocking {
         true => (
             "\n  Passphrase:  the drive's own passphrase",
-            "to unlock, then to mount",
+            "for each step (an image's loop device, unlocking, mounting)",
         ),
         false => ("", "to unmount, then to lock"),
     };

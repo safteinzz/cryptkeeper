@@ -32,7 +32,10 @@ fn held() -> MutexGuard<'static, Option<Capture>> {
 pub fn say(line: String) {
     match held().as_mut() {
         Some(c) => c.got.lines.push(line),
-        None => println!("{line}"),
+        None => {
+            use std::io::Write;
+            let _ = writeln!(std::io::stdout(), "{line}");
+        }
     }
 }
 

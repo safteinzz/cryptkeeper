@@ -60,14 +60,14 @@ pub fn run(json: bool) -> Result<()> {
                 )
             })
             .collect();
-        println!("{}", listing::array(&objects));
+        out!("{}", listing::array(&objects));
     } else {
         for c in &checks {
             let line = match &c.fix {
                 Some(fix) => format!("{}: {fix}", c.detail),
                 None => c.detail.clone(),
             };
-            println!("{:<10} {:<9} {line}", c.kind.word(), c.state);
+            out!("{:<10} {:<9} {line}", c.kind.word(), c.state);
         }
     }
     if checks.iter().any(|c| c.state != "ready") {

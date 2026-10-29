@@ -11,6 +11,16 @@
 
 /// Prints one of ck's own result lines through `out::say`, so the terminal UI
 /// can show it in its status line instead.
+/// Prints a line of the command's own output. A reader that went away
+/// (`ck ls | head`) is ignored, where `println!` would panic and stop the run
+/// halfway.
+macro_rules! out {
+    ($($line:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($line)*);
+    }};
+}
+
 macro_rules! say {
     ($($line:tt)*) => {
         $crate::out::say(format!($($line)*))
@@ -53,7 +63,7 @@ const AFTER: &str = concat!(
     "\
 Kinds of vault, which `unlock` tells apart by what its path is:
   gocryptfs  a folder holding `gocryptfs.conf`, opening into `<name>` beside a `.<name>` one, else where `unlock --at` says
-  luks       a LUKS drive or image file, mounted through udisks; ck locks only what it unlocked
+  luks       a LUKS drive or image file, mounted through udisks, or sudo with `luks = sudo`; ck locks only what it unlocked
   age        a `<name>.age` file, opening to `<name>`, a link to a copy in `$XDG_RUNTIME_DIR`
 
 States, as `ck` and `ck ls` print them: open (unlocked), locked, dead (its open
@@ -67,7 +77,8 @@ names, kinds and state words are fixed. `ck check` says, per kind, ready, missin
 unchecked (polkit could not be asked), and exits 1 unless all are ready. Errors go
 to stderr as `ck: …`; exit 0 on success, 1 on failure, 2 on a usage error.
 gocryptfs, udisksctl and age ask for passwords themselves, gocryptfs reading one
-line from stdin when it is piped; `unlock` has no `--all`, since each asks its own.
+line from stdin when it is piped; `unlock` has no `--all`, since each asks its own,
+and `passwd`, `backup`, `add` and `delete` take the one vault named, on purpose.
 Run `ck <command> --help` for a command's details.",
     "\n\n",
     env!("CARGO_PKG_REPOSITORY"),
@@ -223,7 +234,7 @@ enum Cmd {
         dry_run: bool,
     },
     /// Save a copy of what a vault cannot open without: gocryptfs's conf, a LUKS header  [PATH]
-    ///   --to FILE   save it there (default: a new file in `~/.local/share/cryptkeeper/backups`)
+    ///   --to FILE   save it there (default: a new file in `$XDG_DATA_HOME/cryptkeeper/backups`)
     ///   -n          say what would happen, change nothing
     #[command(verbatim_doc_comment)]
     Backup {
@@ -404,12 +415,28 @@ pub fn tilde(path: &Path) -> String {
 /// Replaces `file` with `body` through a temp file and a rename, so an
 /// interrupted save never leaves half a file; `what` names it in the error.
 pub fn write_atomic(file: &Path, body: &[u8], what: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    // A file kept as a link (into dotfiles, say) is written where it points,
+    // since a rename over the link would leave the real file behind.
+    let linked = fs::read_link(file).ok().map(|to| match to.is_absolute() {
+        true => to,
+        false => file.parent().unwrap_or(Path::new(".")).join(to),
+    });
+    let file = linked.as_deref().unwrap_or(file);
     let dir = file.parent().unwrap_or(Path::new("."));
     if fs::create_dir_all(dir).is_err() {
         bail!("could not create `{}` to save {what}", tilde(dir));
     }
     let tmp = file.with_extension("tmp");
-    if fs::write(&tmp, body).is_err() || fs::rename(&tmp, file).is_err() {
+    let _ = fs::remove_file(&tmp);
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(body));
+    if written.is_err() || fs::rename(&tmp, file).is_err() {
         let _ = fs::remove_file(&tmp);
         bail!("could not write `{}` to save {what}", tilde(file));
     }

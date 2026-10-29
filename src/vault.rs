@@ -377,7 +377,7 @@ fn vaults_in(dir: &Path, known: &[Vault]) -> Vec<Vault> {
 }
 
 /// Where the gocryptfs vault in `cipher` is mounted, when it is.
-fn mounted_at(cipher: &Path) -> Option<PathBuf> {
+pub fn mounted_at(cipher: &Path) -> Option<PathBuf> {
     let real = fs::canonicalize(cipher).ok();
     crate::mounts::gocryptfs_mounts()
         .into_iter()

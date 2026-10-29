@@ -1,6 +1,6 @@
-//! The terminal UI bare `ck` opens on a terminal, in two tabs: Vaults (the
-//! list, then every vault and LUKS drive found that it does not hold) and
-//! This machine (what it can open, and installing what it lacks). The rows are read again every couple of seconds with the same
+//! The terminal UI bare `ck` opens on a terminal, in three tabs: Vaults (the
+//! list, then every vault and LUKS drive found that it does not hold), This
+//! machine (what it can open, and installing what it lacks) and Settings. The rows are read again every couple of seconds with the same
 //! reads `ls` does. Every action runs the function its command runs, and the
 //! screen steps aside only once a program asks on the terminal
 //! (`out::hand_over`), then comes back with the result.

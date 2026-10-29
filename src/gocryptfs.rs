@@ -17,11 +17,43 @@ pub fn need() -> Result<()> {
     Ok(())
 }
 
+/// Whether `dir` holds a gocryptfs vault's encrypted files and nothing
+/// else: a real `gocryptfs.conf` and only names gocryptfs makes, so a folder
+/// with a stray copy of a conf in it is never taken for one.
+pub fn looks_encrypted(dir: &Path) -> bool {
+    let conf = fs::read_to_string(dir.join("gocryptfs.conf")).unwrap_or_default();
+    if !conf.contains("\"EncryptedKey\"") {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        // Its own files, and names encrypted to base64url of 16 bytes or more.
+        matches!(name.as_str(), "gocryptfs.conf" | "gocryptfs.diriv")
+            || name.starts_with("gocryptfs.longname.")
+            || (name.len() >= 22
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '='))
+    })
+}
+
+/// Where `v` is mounted when it is not on its own view, as a `gocryptfs` run
+/// by hand puts it; gocryptfs names its mount after the encrypted folder.
+pub fn open_elsewhere(v: &Vault) -> Option<std::path::PathBuf> {
+    crate::vault::mounted_at(&v.cipher).filter(|p| *p != v.view)
+}
+
 pub fn state(v: &Vault) -> State {
     if !v.cipher.exists() {
         State::Missing
     } else if !mounts::is_mounted(&v.view) {
-        State::Locked
+        match open_elsewhere(v) {
+            Some(p) => State::Open(format!("open at `{}`, not where ck opens it", tilde(&p))),
+            None => State::Locked,
+        }
     } else if !mounts::is_alive(&v.view) {
         State::Dead("gocryptfs died: `ck unlock` clears it".into())
     } else {
@@ -64,6 +96,15 @@ pub fn init(v: &Vault) -> Result<()> {
 
 pub fn unlock(v: &Vault, minutes: Option<u32>, dry: bool) -> Result<()> {
     need()?;
+    // A second gocryptfs on the same folder would write it from two places.
+    if let Some(p) = open_elsewhere(v).filter(|_| !mounts::is_mounted(&v.view)) {
+        bail!(
+            "`{}` is open at `{}` already: use it there, or `ck lock {}` first",
+            tilde(&v.cipher),
+            tilde(&p),
+            tilde(&p)
+        );
+    }
     if v.view.as_os_str().is_empty() {
         let shown = tilde(&v.cipher);
         match crate::scan::opened_before(&v.cipher) {
@@ -179,9 +220,13 @@ pub fn backup(v: &Vault, dest: &Path, dry: bool) -> Result<()> {
 }
 
 pub fn lock(v: &Vault, dry: bool) -> Result<()> {
+    let point = match mounts::is_mounted(&v.view) {
+        true => v.view.clone(),
+        false => open_elsewhere(v).unwrap_or_else(|| v.view.clone()),
+    };
     if !dry {
-        mounts::unmount(&v.view, false)?;
+        mounts::unmount(&point, false)?;
     }
-    say!("locked: `{}`", tilde(&v.view));
+    say!("locked: `{}`", tilde(&point));
     Ok(())
 }

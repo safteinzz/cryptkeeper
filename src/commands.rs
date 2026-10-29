@@ -82,6 +82,19 @@ pub fn init_luks(path: PathBuf, size: Option<String>, wipe: bool, dry: bool) -> 
         },
         None => None,
     };
+    let drive = fs::metadata(&path).is_ok_and(|m| luks::is_block(&m));
+    if drive && size.is_some() {
+        bail!(
+            "`--size` is for a new image file, and `{}` is a drive: drop `--size`",
+            path.display()
+        );
+    }
+    if !drive && wipe {
+        bail!(
+            "`--wipe` is for a drive, and `{}` is not one: drop `--wipe`",
+            tilde(&path)
+        );
+    }
     luks::init(&path, size, wipe, dry)
 }
 
@@ -127,6 +140,12 @@ pub fn passwd(path: Option<PathBuf>, dry: bool) -> Result<()> {
                     "`{}` opens with the key in `{}`, not a passphrase, so there is none to change",
                     tilde(&v.shown()),
                     tilde(id)
+                );
+            }
+            if !matches!(vault::state(&v), State::Locked) {
+                bail!(
+                    "`{}` is open: `ck lock` it first, so `ck passwd` asks the old passphrase, then the new one",
+                    tilde(&v.shown())
                 );
             }
             // Opened with the old passphrase, then locked again with the new one.
@@ -334,22 +353,25 @@ pub fn shell(path: Option<PathBuf>, identity: Option<PathBuf>, dry: bool) -> Res
 
 /// `v` opened for `edit` or `shell`, and whether this run had to unlock it.
 fn open_for(v: Vault, identity: Option<PathBuf>, dry: bool) -> Result<(Vault, bool)> {
-    if matches!(vault::state(&v), State::Open(_) | State::Exposed(_)) {
+    let was_open = matches!(vault::state(&v), State::Open(_) | State::Exposed(_));
+    if was_open {
         if v.kind != Kind::Luks {
             return Ok((v, false));
         }
-        // A drive is used where it is mounted; one unlocked but not mounted gets mounted.
+        // A drive is used where it is mounted.
         if let Some(at) = luks::open_at(&v) {
             return Ok((Vault { view: at, ..v }, false));
         }
     }
+    // A drive unlocked but not mounted only gets mounted here, and was
+    // unlocked before, so it is left that way after.
     unlock_one(&v, None, identity, dry)?;
     // Unlocking a drive can move its view to wherever udisks mounted it.
     let v = registry::load()?
         .into_iter()
         .find(|k| k.cipher == v.cipher)
         .unwrap_or(v);
-    Ok((v, true))
+    Ok((v, !was_open))
 }
 
 /// Locks `v` again when this run unlocked it, or says it was left open.
@@ -433,7 +455,7 @@ fn lock_one(v: &Vault, dry: bool) -> Result<()> {
 /// alive, an unlocked LUKS device, or an age copy or the link left to it.
 fn is_unlocked(v: &Vault) -> bool {
     match v.kind {
-        Kind::Gocryptfs => mounts::is_mounted(&v.view),
+        Kind::Gocryptfs => mounts::is_mounted(&v.view) || gocryptfs::open_elsewhere(v).is_some(),
         Kind::Luks => luks::is_unlocked(v),
         Kind::Age => matches!(
             vault::state(v),
@@ -442,31 +464,38 @@ fn is_unlocked(v: &Vault) -> bool {
     }
 }
 
+/// The vaults `lock --all` closes: every unlocked one but a drive ck never
+/// touches, such as the system disk listed with `ck add`.
 fn open_vaults(known: &[Vault]) -> Vec<Vault> {
-    known.iter().filter(|v| is_unlocked(v)).cloned().collect()
+    known
+        .iter()
+        .filter(|v| is_unlocked(v))
+        .filter(|v| v.kind != Kind::Luks || luks::untouchable(v).is_none())
+        .cloned()
+        .collect()
 }
 
 pub fn ls(json: bool) -> Result<()> {
     let known = registry::load()?;
     let entries = listing::all(&known, &scan::found(&known));
     if json {
-        println!("{}", listing::json(&entries));
+        out!("{}", listing::json(&entries));
         return Ok(());
     }
     if known.is_empty() {
-        println!("no vaults yet: `ck init` makes one, `ck unlock <path>` adds one that exists");
+        out!("no vaults yet: `ck init` makes one, `ck unlock <path>` adds one that exists");
     }
     let rows = listing::rows(&entries);
     let (listed, drives) = rows.split_at(known.len());
     for line in listed {
-        println!("{line}");
+        out!("{line}");
     }
     // The drives the list does not hold, set apart.
     if !drives.is_empty() {
-        println!();
+        out!();
     }
     for line in drives {
-        println!("{line}");
+        out!("{line}");
     }
     Ok(())
 }
@@ -477,7 +506,7 @@ pub fn status() -> Result<()> {
     match vault::nearest(&cwd()?, &known)? {
         Some(found) => {
             for line in listing::rows(&listing::of_vaults(&found, &known)) {
-                println!("{line}");
+                out!("{line}");
             }
         }
         None => bail!(
@@ -521,15 +550,23 @@ pub fn delete(path: PathBuf, yes: bool, dry: bool) -> Result<()> {
         ),
         _ => bail!("`{shown}` is open: `ck lock {shown}` first, then delete it"),
     }
-    let doomed = match v.kind {
-        Kind::Gocryptfs if !vault::is_cipher(&v.cipher) || mounts::points().contains(&v.cipher) => {
-            bail!(
-                "`{}` does not look like a gocryptfs folder any more, so ck leaves it alone",
-                tilde(&v.cipher)
-            )
+    // What goes must still be what the list says it is, or a line left
+    // pointing at someone's own file or folder would delete it.
+    let still = match v.kind {
+        Kind::Gocryptfs => {
+            gocryptfs::looks_encrypted(&v.cipher) && !mounts::points().contains(&v.cipher)
         }
-        _ => v.cipher.clone(),
+        Kind::Luks => luks::is_luks_file(&v.cipher),
+        Kind::Age => age::is_age(&v.cipher),
     };
+    if !still {
+        bail!(
+            "`{}` does not look like an encrypted {} any more, so ck leaves it alone",
+            tilde(&v.cipher),
+            v.kind.word()
+        );
+    }
+    let doomed = v.cipher.clone();
     if !yes {
         bail!(
             "deleting `{shown}` destroys `{}` for good: add `--yes` to go ahead",
@@ -614,7 +651,7 @@ fn ask(all: &[Vault]) -> Result<Vec<usize>> {
         .into_iter()
         .enumerate()
     {
-        println!("{:>3}  {line}", n + 1);
+        out!("{:>3}  {line}", n + 1);
     }
     eprint!("forget which? numbers, e.g. `1 3` (empty cancels): ");
     let _ = std::io::Write::flush(&mut std::io::stderr());

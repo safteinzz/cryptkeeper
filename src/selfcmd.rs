@@ -40,10 +40,10 @@ pub fn run(cmd: Cmd) -> Result<()> {
 
 fn update(yes: bool, dry: bool) -> Result<()> {
     if !yes && !dry && !confirm() {
-        println!("nothing updated");
+        out!("nothing updated");
         return Ok(());
     }
-    println!("updating with `cargo install {CRATE} --force`\n");
+    out!("updating with `cargo install {CRATE} --force`\n");
     if dry {
         return Ok(());
     }
@@ -52,7 +52,7 @@ fn update(yes: bool, dry: bool) -> Result<()> {
         .status()
     {
         Ok(st) if st.success() => {
-            println!("\n{CRATE} is up to date");
+            out!("\n{CRATE} is up to date");
             Ok(())
         }
         Ok(_) => bail!("`cargo install {CRATE}` failed: its own lines above say why"),
@@ -73,10 +73,10 @@ fn check() -> Result<()> {
         }
     };
     if newer(&latest, current) {
-        println!("{CRATE} {latest} is out, you have {current}: run `ck self update`");
+        out!("{CRATE} {latest} is out, you have {current}: run `ck self update`");
         std::process::exit(1);
     } else {
-        println!("{CRATE} {current} is the latest release");
+        out!("{CRATE} {current} is the latest release");
     }
     Ok(())
 }

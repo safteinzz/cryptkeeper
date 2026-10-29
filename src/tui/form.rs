@@ -1,6 +1,6 @@
-//! The forms: the three `c` offers (a new encrypted folder, a file to
-//! encrypt, a vault that exists to add), and the folder a gocryptfs vault ck
-//! found opens into. Each shows the `ck` command it will run while it is
+//! The forms: the four `c` offers (a file to encrypt, a new encrypted
+//! folder, a new LUKS image or drive, a vault you already have to list), the
+//! folder a gocryptfs vault ck found opens into, and a typed setting. Each shows the `ck` command it will run while it is
 //! typed.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

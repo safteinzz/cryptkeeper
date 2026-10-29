@@ -10,8 +10,8 @@ FROM ghcr.io/charmbracelet/vhs:v0.12.1@sha256:3afed459e6d7860f6bb8b9a22ae29d5927
 # to install after the next point release. Move the date to update.
 ARG SNAPSHOT=20261006T000000Z
 
-# gocryptfs, which `egc` drives to make and mount the vault, with fuse3's
-# `fusermount3`, which locks it.
+# gocryptfs, which `ck` drives to make and mount the vault, with fuse3's
+# `fusermount3`, which locks it, and age for the encrypted file.
 RUN rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list \
  && for suite in trixie trixie-updates; do \
       echo "deb http://snapshot.debian.org/archive/debian/$SNAPSHOT $suite main"; \
@@ -20,5 +20,5 @@ RUN rm -f /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list \
       >> /etc/apt/sources.list \
  && apt-get -o Acquire::Check-Valid-Until=false update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      gocryptfs \
+      gocryptfs age \
  && rm -rf /var/lib/apt/lists/*

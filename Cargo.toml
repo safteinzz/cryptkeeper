@@ -1,23 +1,27 @@
 [package]
-name = "easygocryptfs"
+name = "cryptkeeper"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
-description = "gocryptfs without the flags - lock and unlock encrypted folders from wherever you stand"
+description = "encryption without the fuss - lock and unlock gocryptfs folders, LUKS drives and age files in one place"
 authors = ["Pablo Antonio Hernández Hernández (safteinzz)"]
 license = "AGPL-3.0-only"
 readme = "README.md"
-repository = "https://gitlab.com/safteinzz/easygocryptfs"
-keywords = ["gocryptfs", "encryption", "vault", "cli"]
+repository = "https://gitlab.com/safteinzz/cryptkeeper"
+keywords = ["gocryptfs", "luks", "age", "encryption", "vault"]
 categories = ["command-line-utilities", "cryptography"]
 exclude = ["readme-assets/", "demo/"]
 
 [[bin]]
-name = "egc"
+name = "ck"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-clap   = { version = "4", features = ["derive"] }
-ctrlc  = "3"
-dirs   = "5"
+anyhow        = "1"
+clap          = { version = "4", features = ["derive"] }
+clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
+crossterm     = "0.28"
+dirs          = "5"
+nix           = { version = "0.30", features = ["term", "signal", "process"] }
+ratatui       = "0.29"
+signal-hook   = "0.3"

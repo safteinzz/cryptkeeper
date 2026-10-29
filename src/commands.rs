@@ -1,23 +1,39 @@
 //! One function per CLI command. Every command that changes something takes
 //! `dry`, and a dry run prints the same lines the real run would.
 
+use crate::run::{self, Ran};
 use crate::settings;
-use crate::vault::{self, Vault};
-use crate::{mounts, registry, tilde};
+use crate::vault::{self, Kind, State, Vault};
+use crate::{age, gocryptfs, listing, luks, mounts, registry, scan, tilde};
 use anyhow::{Result, bail};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-pub fn init(name: Option<String>, dir: Option<PathBuf>, dry: bool) -> Result<()> {
-    need_gocryptfs()?;
-    let s = settings::load();
+pub fn init(
+    name: Option<String>,
+    dir: Option<PathBuf>,
+    identity: Option<PathBuf>,
+    dry: bool,
+) -> Result<()> {
     let dir = match dir {
         Some(d) => d,
         None => cwd()?,
     };
+    // An existing file, or anything that is not a folder, makes an age vault.
+    if let Some(n) = &name
+        && fs::symlink_metadata(dir.join(n)).is_ok_and(|m| !m.is_dir())
+    {
+        return age::init(&dir.join(n), identity, dry);
+    }
+    if identity.is_some() {
+        bail!(
+            "`-i` encrypts an existing file into an age vault, and no such file was named: drop `-i`"
+        );
+    }
+    gocryptfs::need()?;
+    let s = settings::load();
     let Ok(dir) = fs::canonicalize(&dir) else {
         bail!("`{}` does not exist", dir.display());
     };
@@ -28,7 +44,7 @@ pub fn init(name: Option<String>, dir: Option<PathBuf>, dry: bool) -> Result<()>
         None => s.name.clone(),
     };
     if name.is_empty() || name.starts_with('.') || name.contains(['/', '\t', '\n']) {
-        bail!("`{name}` cannot name a vault: use a plain folder name, e.g. `egc init photos`");
+        bail!("`{name}` cannot name a vault: use a plain folder name, e.g. `ck init photos`");
     }
     let v = Vault::from_view(&dir.join(&name));
     registry::check_storable(&v)?;
@@ -38,117 +54,335 @@ pub fn init(name: Option<String>, dir: Option<PathBuf>, dry: bool) -> Result<()>
     // An empty one is what a cancelled `init` left behind, so it is reused.
     if v.cipher.exists() && !is_empty_dir(&v.cipher) {
         bail!(
-            "`{}` already exists: pick another name with `egc init <name>`",
+            "`{}` already exists: pick another name with `ck init <name>`",
             tilde(&v.cipher)
         );
     }
     // gocryptfs will only open into an empty folder.
     if v.view.exists() && !is_empty_dir(&v.view) {
         bail!(
-            "`{}` already has files in it: pick another name with `egc init <name>`",
+            "`{}` already has files in it: pick another name with `ck init <name>`",
             tilde(&v.view)
         );
     }
     if !dry {
-        let made: Vec<&Path> = [v.cipher.as_path(), v.view.as_path()]
-            .into_iter()
-            .filter(|p| !p.exists())
-            .collect();
-        if fs::create_dir_all(&v.cipher).is_err() || fs::create_dir_all(&v.view).is_err() {
-            bail!("could not create the vault's folders in `{}`", tilde(&dir));
-        }
-        // Without `-q`, so gocryptfs prints the master key, the one way back
-        // in after a forgotten password, which it shows only this once.
-        let mut cmd = Command::new("gocryptfs");
-        cmd.arg("-init").arg(&v.cipher);
-        let ran = run_gocryptfs(&mut cmd);
-        if ran != Ran::Done {
-            // Only the folders made above go, and remove_dir only takes an empty one.
-            for p in made {
-                let _ = fs::remove_dir(p);
-            }
-            match ran {
-                Ran::Cancelled => bail!("cancelled, so no vault was made"),
-                _ => bail!("`gocryptfs -init` failed, so no vault was made"),
-            }
-        }
-        registry::remember(&v)?;
+        gocryptfs::init(&v)?;
     }
-    println!("made `{}`: open it with `egc unlock`", tilde(&v.view));
+    say!("made `{}`: open it with `ck unlock`", tilde(&v.view));
     Ok(())
 }
 
-pub fn unlock(path: Option<PathBuf>, minutes: Option<u32>, dry: bool) -> Result<()> {
-    need_gocryptfs()?;
-    let v = pick(path, "unlock")?;
-    registry::check_storable(&v)?;
-    registry::load()?;
-    if mounts::is_mounted(&v.view) {
-        if mounts::is_alive(&v.view) {
-            if !dry {
-                registry::remember(&v)?;
-            }
-            println!("already unlocked: `{}`", tilde(&v.view));
-            return Ok(());
-        }
-        if !dry {
-            mounts::unmount(&v.view, true)?;
-        }
+/// `ck init --luks`: a LUKS image of `size` (`1G`) at `path`, or with
+/// `wipe` the drive `path` names.
+pub fn init_luks(path: PathBuf, size: Option<String>, wipe: bool, dry: bool) -> Result<()> {
+    let size = match size.as_deref() {
+        Some(s) => match luks::parse_size(s) {
+            Some(n) => Some(n),
+            None => bail!("`{s}` is not a size: write it like `500M` or `4G`"),
+        },
+        None => None,
+    };
+    luks::init(&path, size, wipe, dry)
+}
+
+/// `ck add`: puts the vault `path` names in the list as it is, opening
+/// nothing, so a vault found, or a drive ck never touches, shows as yours.
+pub fn add(path: PathBuf, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    if let Some(v) = vault::by_name(&known, &path) {
+        say!("already listed: `{}`", tilde(&v.shown()));
+        return Ok(());
     }
+    let v = vault::resolve(&path, "add", &known)?;
+    if known.iter().any(|k| k.cipher == v.cipher) {
+        say!("already listed: `{}`", tilde(&v.shown()));
+        return Ok(());
+    }
+    registry::check_storable(&v)?;
     if !dry {
-        if fs::create_dir_all(&v.view).is_err() {
-            bail!(
-                "could not create `{}` to open the vault into",
-                tilde(&v.view)
-            );
-        }
-        let mut cmd = Command::new("gocryptfs");
-        cmd.arg("-q");
-        // With no syslog to hand its messages to, the mount prints a "Unix syslog
-        // delivery error" per stream and then drops every later warning, a
-        // corrupt block included; `-nosyslog` keeps them on this terminal.
-        if !Path::new("/dev/log").exists() {
-            cmd.arg("-nosyslog");
-        }
-        if let Some(m) = minutes {
-            cmd.args(["-i", &format!("{m}m")]);
-        }
-        cmd.arg(&v.cipher).arg(&v.view);
-        match run_gocryptfs(&mut cmd) {
-            Ran::Done => {}
-            Ran::Cancelled => bail!("cancelled, so `{}` stays locked", tilde(&v.view)),
-            Ran::Failed => bail!("could not unlock `{}`", tilde(&v.view)),
-        }
         registry::remember(&v)?;
     }
-    match minutes {
-        Some(m) => println!("unlocked: `{}`, locks after {m}m unused", tilde(&v.view)),
-        None => println!("unlocked: `{}`", tilde(&v.view)),
+    say!("listed `{}`", tilde(&v.shown()));
+    Ok(())
+}
+
+/// `ck passwd`: changes the password of the vault `path` names, through the
+/// tool that made it.
+pub fn passwd(path: Option<PathBuf>, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    let v = pick(path, "passwd", &known)?;
+    if let State::Missing = vault::state(&v) {
+        bail!(
+            "`{}` is missing ({}): bring it back first",
+            tilde(&v.shown()),
+            listing::missing_note(&v)
+        );
+    }
+    match v.kind {
+        Kind::Gocryptfs => gocryptfs::passwd(&v, dry),
+        Kind::Luks => luks::passwd(&v, dry),
+        Kind::Age => {
+            if let Some(id) = &v.identity {
+                bail!(
+                    "`{}` opens with the key in `{}`, not a passphrase, so there is none to change",
+                    tilde(&v.shown()),
+                    tilde(id)
+                );
+            }
+            // Opened with the old passphrase, then locked again with the new one.
+            let (v, _) = open_for(v, None, dry)?;
+            let _held = run::take_terminal();
+            if !dry {
+                eprintln!("ck: now give it the new passphrase");
+            }
+            lock_one(&v, dry)?;
+            say!("`{}` now opens with the new passphrase", tilde(&v.shown()));
+            Ok(())
+        }
+    }
+}
+
+/// `ck backup`: saves the vault's own key material (gocryptfs's conf, a LUKS
+/// header) to `to`, or to a new file under `$XDG_DATA_HOME/cryptkeeper/backups`.
+pub fn backup(path: Option<PathBuf>, to: Option<PathBuf>, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    let v = pick(path, "backup", &known)?;
+    if let State::Missing = vault::state(&v) {
+        bail!(
+            "`{}` is missing ({}): bring it back first",
+            tilde(&v.shown()),
+            listing::missing_note(&v)
+        );
+    }
+    let suffix = match v.kind {
+        Kind::Gocryptfs => "gocryptfs.conf",
+        Kind::Luks => "luks-header",
+        Kind::Age => bail!(
+            "an age file has no header apart from itself: copy `{}` somewhere safe instead",
+            tilde(&v.cipher)
+        ),
+    };
+    let dest = match to {
+        Some(p) => p,
+        None => {
+            let dir = dirs::data_dir()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"))
+                .join("cryptkeeper/backups");
+            if !dry && fs::create_dir_all(&dir).is_err() {
+                bail!("could not create `{}` to save the backup in", tilde(&dir));
+            }
+            let base = vault::file_name(&v.shown())
+                .trim_start_matches('.')
+                .to_string();
+            (0..)
+                .map(|n| match n {
+                    0 => dir.join(format!("{base}.{suffix}")),
+                    n => dir.join(format!("{base}.{suffix}.{n}")),
+                })
+                .find(|p| !p.exists())
+                .unwrap_or_default()
+        }
+    };
+    if dest.exists() {
+        bail!(
+            "`{}` exists already: name another with `--to`",
+            tilde(&dest)
+        );
+    }
+    match v.kind {
+        Kind::Gocryptfs => gocryptfs::backup(&v, &dest, dry),
+        _ => luks::backup(&v, &dest, dry),
+    }
+}
+
+pub fn unlock(
+    path: Option<PathBuf>,
+    minutes: Option<u32>,
+    identity: Option<PathBuf>,
+    at: Option<PathBuf>,
+    dry: bool,
+) -> Result<()> {
+    let known = registry::load()?;
+    let mut v = pick(path, "unlock", &known)?;
+    if let Some(at) = at {
+        if v.kind != Kind::Gocryptfs {
+            bail!(
+                "`--at` works only on gocryptfs vaults, and `{}` is a {} vault: drop `--at`",
+                tilde(&v.shown()),
+                v.kind.word()
+            );
+        }
+        let at = vault::real_parent(&at);
+        let open = mounts::gocryptfs_mounts()
+            .into_iter()
+            .find(|(source, _)| *source == v.cipher)
+            .map(|(_, point)| point);
+        if let Some(open) = open.filter(|p| *p != at) {
+            bail!(
+                "`{}` is open at `{}` already: `ck lock {}` first",
+                tilde(&v.cipher),
+                tilde(&open),
+                tilde(&open)
+            );
+        }
+        v.view = at;
+    }
+    unlock_one(&v, minutes, identity, dry)
+}
+
+/// Unlocks `v` the way `ck unlock` does, after the checks every caller shares.
+fn unlock_one(v: &Vault, minutes: Option<u32>, identity: Option<PathBuf>, dry: bool) -> Result<()> {
+    registry::check_storable(v)?;
+    if minutes.is_some() && v.kind != Kind::Gocryptfs {
+        bail!(
+            "`-t` works only on gocryptfs vaults, and `{}` is a {} vault: drop `-t`",
+            tilde(&v.shown()),
+            v.kind.word()
+        );
+    }
+    if identity.is_some() && v.kind != Kind::Age {
+        bail!(
+            "`-i` works only on age files, and `{}` is a {} vault: drop `-i`",
+            tilde(&v.shown()),
+            v.kind.word()
+        );
+    }
+    if let State::Missing = vault::state(v) {
+        bail!(
+            "`{}` is missing ({}): bring it back, or `ck forget` it",
+            tilde(&v.shown()),
+            listing::missing_note(v)
+        );
+    }
+    match v.kind {
+        Kind::Gocryptfs => gocryptfs::unlock(v, minutes, dry)?,
+        Kind::Luks => luks::unlock(v, dry)?,
+        Kind::Age => age::unlock(v, identity, dry)?,
     }
     // A shell already inside the view still sees the empty folder underneath.
-    if cwd().is_ok_and(|c| c.starts_with(&v.view)) {
-        println!("you are inside it: `cd .` to see the files");
+    if v.kind == Kind::Gocryptfs && cwd().is_ok_and(|c| c.starts_with(&v.view)) {
+        say!("you are inside it: `cd .` to see the files");
     }
     Ok(())
+}
+
+/// `ck edit`: the age vault `path` names, opened in `$VISUAL`, else
+/// `$EDITOR`, else `vi`, and locked again when the editor exits if this run
+/// unlocked it.
+pub fn edit(path: Option<PathBuf>, identity: Option<PathBuf>, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    let v = pick(path, "edit", &known)?;
+    if v.kind != Kind::Age {
+        bail!(
+            "`ck edit` opens age files, and `{}` is a {} vault: `ck shell {}` opens it",
+            tilde(&v.shown()),
+            v.kind.word(),
+            tilde(&v.shown())
+        );
+    }
+    let (v, unlocked) = open_for(v, identity, dry)?;
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|e| !e.trim().is_empty()))
+        .unwrap_or_else(|| "vi".into());
+    let edited = dry || {
+        // Through `sh`, so an editor given with its flags (`code --wait`) runs as typed.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("{editor} \"$1\""))
+            .arg("sh")
+            .arg(&v.view);
+        run::foreground(&mut cmd) == Ran::Done
+    };
+    close_after(&v, unlocked, dry)?;
+    if !edited {
+        bail!("`{editor}` did not exit cleanly: its own lines above say why");
+    }
+    Ok(())
+}
+
+/// `ck shell`: a shell in the vault `path` names (the view's folder for an
+/// age file) with `CK_VAULT` set to its view, and the vault locked again when
+/// the shell exits if this run unlocked it.
+pub fn shell(path: Option<PathBuf>, identity: Option<PathBuf>, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    let v = pick(path, "shell", &known)?;
+    let (v, unlocked) = open_for(v, identity, dry)?;
+    if !dry {
+        let dir = match v.kind {
+            Kind::Age => v.view.parent().unwrap_or(Path::new("/")),
+            _ => v.view.as_path(),
+        };
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let found = Path::new(&shell).is_file() || run::on_path(&shell);
+        if !found || !dir.is_dir() {
+            close_after(&v, unlocked, false)?;
+            bail!("could not start `{shell}` in `{}`", tilde(dir));
+        }
+        // The shell's own exit code is whatever its last command left, not a failure of ck's.
+        let _ = run::foreground(
+            Command::new(&shell)
+                .current_dir(dir)
+                .env("CK_VAULT", &v.view),
+        );
+    }
+    close_after(&v, unlocked, dry)
+}
+
+/// `v` opened for `edit` or `shell`, and whether this run had to unlock it.
+fn open_for(v: Vault, identity: Option<PathBuf>, dry: bool) -> Result<(Vault, bool)> {
+    if matches!(vault::state(&v), State::Open(_) | State::Exposed(_)) {
+        if v.kind != Kind::Luks {
+            return Ok((v, false));
+        }
+        // A drive is used where it is mounted; one unlocked but not mounted gets mounted.
+        if let Some(at) = luks::open_at(&v) {
+            return Ok((Vault { view: at, ..v }, false));
+        }
+    }
+    unlock_one(&v, None, identity, dry)?;
+    // Unlocking a drive can move its view to wherever udisks mounted it.
+    let v = registry::load()?
+        .into_iter()
+        .find(|k| k.cipher == v.cipher)
+        .unwrap_or(v);
+    Ok((v, true))
+}
+
+/// Locks `v` again when this run unlocked it, or says it was left open.
+fn close_after(v: &Vault, unlocked: bool, dry: bool) -> Result<()> {
+    if !unlocked {
+        say!("left open: `{}`, as it was", tilde(&v.shown()));
+        return Ok(());
+    }
+    if dry {
+        say!("locked: `{}`", tilde(&v.shown()));
+        return Ok(());
+    }
+    lock_one(v, false)
 }
 
 pub fn lock(path: Option<PathBuf>, all: bool, dry: bool) -> Result<()> {
+    let known = registry::load()?;
     if all {
-        return lock_all(dry);
+        return lock_all(&known, dry);
     }
-    let away = path.is_none() && vault::nearest(&cwd()?)?.is_none();
+    let away = path.is_none() && vault::nearest(&cwd()?, &known)?.is_none();
     let v = if away {
         // Away from every vault, the only open one is the obvious one to lock.
-        match open_vaults()?.as_slice() {
+        match open_vaults(&known).as_slice() {
             [one] => one.clone(),
             [] => bail!("no vault in or above this folder, and none is unlocked"),
-            _ => bail!("no vault in or above this folder: name one, or `egc lock --all`"),
+            _ => bail!("no vault in or above this folder: name one, or `ck lock --all`"),
         }
     } else {
-        pick(path, "lock")?
+        pick(path, "lock", &known)?
     };
-    if !mounts::is_mounted(&v.view) {
-        println!("already locked: `{}`", tilde(&v.view));
+    if !is_unlocked(&v) {
+        say!("already locked: `{}`", tilde(&v.shown()));
         return Ok(());
     }
     lock_one(&v, dry)
@@ -156,17 +390,22 @@ pub fn lock(path: Option<PathBuf>, all: bool, dry: bool) -> Result<()> {
 
 /// Locks every open vault, carrying on past one that refuses and failing at
 /// the end if any did.
-fn lock_all(dry: bool) -> Result<()> {
-    let open = open_vaults()?;
+fn lock_all(known: &[Vault], dry: bool) -> Result<()> {
+    let open = open_vaults(known);
     if open.is_empty() {
-        println!("nothing is unlocked");
+        say!("nothing is unlocked");
         return Ok(());
     }
     let mut failed = 0;
-    for v in &open {
+    for (i, v) in open.iter().enumerate() {
         if let Err(e) = lock_one(v, dry) {
-            eprintln!("egc: {e}");
+            eprintln!("ck: {e}");
             failed += 1;
+            // Ctrl-C means stop, not ask the next vault for its password.
+            if run::interrupted() {
+                failed += open.len() - i - 1;
+                break;
+            }
         }
     }
     if failed > 0 {
@@ -176,63 +415,161 @@ fn lock_all(dry: bool) -> Result<()> {
 }
 
 fn lock_one(v: &Vault, dry: bool) -> Result<()> {
-    if cwd().is_ok_and(|c| c.starts_with(&v.view)) {
+    let inside = !v.view.as_os_str().is_empty() && cwd().is_ok_and(|c| c.starts_with(&v.view));
+    if inside {
         bail!(
-            "your shell is inside `{}`: `cd` out of it, then `egc lock`",
+            "your shell is inside `{}`: `cd` out of it, then `ck lock`",
             tilde(&v.view)
         );
     }
-    if !dry {
-        mounts::unmount(&v.view, false)?;
+    match v.kind {
+        Kind::Gocryptfs => gocryptfs::lock(v, dry),
+        Kind::Luks => luks::lock(v, dry),
+        Kind::Age => age::lock(v, dry),
     }
-    println!("locked: `{}`", tilde(&v.view));
-    Ok(())
 }
 
-fn open_vaults() -> Result<Vec<Vault>> {
-    Ok(registry::load()?
-        .into_iter()
-        .filter(|v| mounts::is_mounted(&v.view))
-        .collect())
+/// Whether `v` has anything for `lock` to close: a gocryptfs mount, dead or
+/// alive, an unlocked LUKS device, or an age copy or the link left to it.
+fn is_unlocked(v: &Vault) -> bool {
+    match v.kind {
+        Kind::Gocryptfs => mounts::is_mounted(&v.view),
+        Kind::Luks => luks::is_unlocked(v),
+        Kind::Age => matches!(
+            vault::state(v),
+            State::Open(_) | State::Dead(_) | State::Exposed(_)
+        ),
+    }
 }
 
-pub fn ls() -> Result<()> {
-    let all = registry::load()?;
-    if all.is_empty() {
-        println!("no vaults yet: `egc init` makes one, `egc unlock` adds one that exists");
+fn open_vaults(known: &[Vault]) -> Vec<Vault> {
+    known.iter().filter(|v| is_unlocked(v)).cloned().collect()
+}
+
+pub fn ls(json: bool) -> Result<()> {
+    let known = registry::load()?;
+    let entries = listing::all(&known, &scan::found(&known));
+    if json {
+        println!("{}", listing::json(&entries));
         return Ok(());
     }
-    print_rows(&all);
+    if known.is_empty() {
+        println!("no vaults yet: `ck init` makes one, `ck unlock <path>` adds one that exists");
+    }
+    let rows = listing::rows(&entries);
+    let (listed, drives) = rows.split_at(known.len());
+    for line in listed {
+        println!("{line}");
+    }
+    // The drives the list does not hold, set apart.
+    if !drives.is_empty() {
+        println!();
+    }
+    for line in drives {
+        println!("{line}");
+    }
     Ok(())
 }
 
-/// Bare `egc`: the vaults nearest the current folder, as `ls` shows them.
+/// Bare `ck`: the vaults nearest the current folder, as `ls` shows them.
 pub fn status() -> Result<()> {
-    match vault::nearest(&cwd()?)? {
-        Some(found) => print_rows(&found),
+    let known = registry::load()?;
+    match vault::nearest(&cwd()?, &known)? {
+        Some(found) => {
+            for line in listing::rows(&listing::of_vaults(&found, &known)) {
+                println!("{line}");
+            }
+        }
         None => bail!(
-            "no vault in or above this folder: `egc ls` lists every vault, `egc init` makes one"
+            "no vault in or above this folder: `ck ls` lists every vault, `ck init` makes one"
         ),
     }
     Ok(())
 }
 
-/// Drops every vault whose folder is gone from the list.
+/// Drops every vault whose encrypted side is gone from the list.
 pub fn clear(dry: bool) -> Result<()> {
     let all = registry::load()?;
     let picked = (0..all.len())
-        .filter(|&i| !all[i].cipher.exists())
+        .filter(|&i| matches!(vault::state(&all[i]), State::Missing))
         .collect();
     drop_lines(all, picked, dry)
 }
 
+/// `ck delete`: removes a locked vault for good (a gocryptfs vault's
+/// encrypted folder and its empty view, an `.age` file, a LUKS image) and
+/// its line in the list. Refused for an open vault, a drive, and without
+/// `yes`.
+pub fn delete(path: PathBuf, yes: bool, dry: bool) -> Result<()> {
+    let known = registry::load()?;
+    let v = vault::resolve(&path, "delete", &known)?;
+    let shown = tilde(&v.shown());
+    // Only the vault named, never one found walking up from a folder in or beside it.
+    if !vault::is_named_by(&v, &path) {
+        bail!(
+            "`{}` is not a vault itself, only in or beside `{shown}`: name the vault to delete, e.g. `ck delete {shown} --yes`",
+            tilde(&path)
+        );
+    }
+    if v.kind == Kind::Luks && v.cipher.starts_with("/dev") {
+        bail!("a drive is never deleted: `ck forget {shown}` only drops it from the list");
+    }
+    match vault::state(&v) {
+        State::Locked => {}
+        State::Missing => bail!(
+            "`{shown}` is missing, so there is nothing to delete: `ck forget {shown}` drops it from the list"
+        ),
+        _ => bail!("`{shown}` is open: `ck lock {shown}` first, then delete it"),
+    }
+    let doomed = match v.kind {
+        Kind::Gocryptfs if !vault::is_cipher(&v.cipher) || mounts::points().contains(&v.cipher) => {
+            bail!(
+                "`{}` does not look like a gocryptfs folder any more, so ck leaves it alone",
+                tilde(&v.cipher)
+            )
+        }
+        _ => v.cipher.clone(),
+    };
+    if !yes {
+        bail!(
+            "deleting `{shown}` destroys `{}` for good: add `--yes` to go ahead",
+            tilde(&doomed)
+        );
+    }
+    if !dry {
+        let gone = match v.kind {
+            Kind::Gocryptfs => fs::remove_dir_all(&doomed),
+            _ => fs::remove_file(&doomed),
+        };
+        if gone.is_err() {
+            bail!("could not delete `{}`", tilde(&doomed));
+        }
+        // An empty view folder, or a link left to an age copy, goes with it.
+        if v.kind == Kind::Gocryptfs && is_empty_dir(&v.view) {
+            let _ = fs::remove_dir(&v.view);
+        }
+        if v.kind == Kind::Age
+            && fs::symlink_metadata(&v.view).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&v.view);
+        }
+        let all = registry::load()?;
+        if all.iter().any(|k| k.cipher == v.cipher) {
+            let rest: Vec<Vault> = all.into_iter().filter(|k| k.cipher != v.cipher).collect();
+            registry::save(&rest)?;
+        }
+    }
+    say!("deleted `{}`", tilde(&doomed));
+    Ok(())
+}
+
 /// Drops vaults from the list, missing or not: the ones `names` spells as `ls`
 /// prints them, or with none the ones picked by number at a prompt. Never
-/// touches a vault's folders.
+/// touches a vault itself.
 pub fn forget(names: Vec<String>, dry: bool) -> Result<()> {
     let all = registry::load()?;
     if all.is_empty() {
-        println!("no vaults listed, so nothing to forget");
+        say!("no vaults listed, so nothing to forget");
         return Ok(());
     }
     let picked = if names.is_empty() {
@@ -246,21 +583,17 @@ pub fn forget(names: Vec<String>, dry: bool) -> Result<()> {
     drop_lines(all, picked, dry)
 }
 
-/// The vault in `all` that `name` spells, as a view or an encrypted folder,
-/// with `~` for home as `ls` prints it.
+/// The index of the vault in `all` that `name` spells, with `~` for home as
+/// `ls` prints it.
 fn by_name(all: &[Vault], name: &str) -> Result<usize> {
     let path = match name.strip_prefix("~/") {
         Some(rest) => dirs::home_dir().unwrap_or_default().join(rest),
         None => PathBuf::from(name),
     };
-    let path = std::path::absolute(&path).unwrap_or(path);
-    let is = |p: &Path| all.iter().position(|v| v.view == p || v.cipher == p);
-    // The name as given first, so a symlinked entry is not mistaken for the
-    // one its link points at; resolved only when nothing matches as given.
-    let found = is(&path).or_else(|| path.canonicalize().ok().and_then(|p| is(&p)));
+    let found = vault::by_name(all, &path).and_then(|v| all.iter().position(|a| a == v));
     match found {
         Some(i) => Ok(i),
-        None => bail!("`{name}` is not in `egc ls`: nothing was forgotten"),
+        None => bail!("`{name}` is not in `ck ls`: nothing was forgotten"),
     }
 }
 
@@ -277,10 +610,13 @@ fn ask_name(default: &str) -> Result<String> {
 }
 
 fn ask(all: &[Vault]) -> Result<Vec<usize>> {
-    for (n, line) in rows(all).into_iter().enumerate() {
+    for (n, line) in listing::rows(&listing::of_vaults(all, all))
+        .into_iter()
+        .enumerate()
+    {
         println!("{:>3}  {line}", n + 1);
     }
-    eprint!("forget which? numbers, e.g. `1 3` (empty cancels):");
+    eprint!("forget which? numbers, e.g. `1 3` (empty cancels): ");
     let _ = std::io::Write::flush(&mut std::io::stderr());
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
@@ -301,7 +637,7 @@ fn ask(all: &[Vault]) -> Result<Vec<usize>> {
 
 fn drop_lines(mut all: Vec<Vault>, mut picked: Vec<usize>, dry: bool) -> Result<()> {
     if picked.is_empty() {
-        println!("nothing to forget");
+        say!("nothing to forget");
         return Ok(());
     }
     picked.sort_unstable();
@@ -311,57 +647,17 @@ fn drop_lines(mut all: Vec<Vault>, mut picked: Vec<usize>, dry: bool) -> Result<
         registry::save(&all)?;
     }
     for v in gone.iter().rev() {
-        println!("forgot `{}`", tilde(&v.view));
+        say!("forgot `{}`", tilde(&v.shown()));
     }
     Ok(())
 }
 
-fn print_rows(vaults: &[Vault]) {
-    for line in rows(vaults) {
-        println!("{line}");
-    }
-}
-
-/// One aligned `state  place  note` line per vault.
-fn rows(vaults: &[Vault]) -> Vec<String> {
-    let rows: Vec<(&str, String, String)> = vaults
-        .iter()
-        .map(|v| {
-            let (state, note) = if !v.cipher.exists() {
-                (
-                    "missing",
-                    "drive not plugged in, or the folder moved".to_string(),
-                )
-            } else if !mounts::is_mounted(&v.view) {
-                ("locked", String::new())
-            } else if !mounts::is_alive(&v.view) {
-                ("dead", "gocryptfs died: `egc unlock` clears it".to_string())
-            } else {
-                let note = mounts::idle_timeout(&v.view)
-                    .map(|t| format!("locks after {t} unused"))
-                    .unwrap_or_default();
-                ("open", note)
-            };
-            (state, tilde(&v.view), note)
-        })
-        .collect();
-    let width = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
-    rows.into_iter()
-        .map(|(state, place, note)| {
-            format!("{state:<8} {place:<width$}  {note}")
-                .trim_end()
-                .to_string()
-        })
-        .collect()
-}
-
 /// The vault `path` names, or the one the current folder is in.
-fn pick(path: Option<PathBuf>, verb: &str) -> Result<Vault> {
-    let start = match path {
-        Some(p) => p,
-        None => cwd()?,
-    };
-    vault::find(&start, verb)
+fn pick(path: Option<PathBuf>, verb: &str, known: &[Vault]) -> Result<Vault> {
+    match path {
+        Some(p) => vault::resolve(&p, verb, known),
+        None => vault::find(&cwd()?, verb, known),
+    }
 }
 
 fn cwd() -> Result<PathBuf> {
@@ -371,43 +667,6 @@ fn cwd() -> Result<PathBuf> {
     }
 }
 
-#[derive(PartialEq)]
-enum Ran {
-    Done,
-    Cancelled,
-    Failed,
-}
-
-/// Runs gocryptfs in the foreground so it can ask for a password. Ctrl-C at
-/// that prompt reaches the whole process group, so egc catches it instead of
-/// dying with gocryptfs, and the caller gets `Cancelled` to clean up after.
-fn run_gocryptfs(cmd: &mut Command) -> Ran {
-    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-    let _ = ctrlc::set_handler(|| INTERRUPTED.store(true, Ordering::SeqCst));
-    let ok = cmd.status().is_ok_and(|st| st.success());
-    if ok {
-        Ran::Done
-    } else if INTERRUPTED.load(Ordering::SeqCst) {
-        // gocryptfs died mid-prompt, leaving the cursor after `Password:`.
-        eprintln!();
-        Ran::Cancelled
-    } else {
-        Ran::Failed
-    }
-}
-
 fn is_empty_dir(dir: &Path) -> bool {
     fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none())
-}
-
-fn need_gocryptfs() -> Result<()> {
-    let found = std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| Path::new(&d).join("gocryptfs").is_file())
-    });
-    if !found {
-        bail!(
-            "`gocryptfs` is not installed: see https://github.com/rfjakob/gocryptfs#installation"
-        );
-    }
-    Ok(())
 }

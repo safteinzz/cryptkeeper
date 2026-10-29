@@ -1,6 +1,6 @@
-//! `egc self`: manage the installed binary itself.
+//! `ck self`: manage the installed binary itself.
 //!
-//! `self update` shells out to `cargo install easygocryptfs --force`, the crate
+//! `self update` shells out to `cargo install cryptkeeper --force`, the crate
 //! name rather than the command you type. `self check` asks the registry through
 //! `cargo search`, so there is no HTTP client in the dependency tree and the
 //! answer comes from the same registry `cargo install` would pull from.
@@ -26,6 +26,8 @@ pub enum Cmd {
         dry_run: bool,
     },
     /// Ask crates.io whether a newer release exists, without installing anything
+    ///   exits 0 when this is the newest, 1 when one is out, 2 when it could not ask
+    #[command(verbatim_doc_comment)]
     Check,
 }
 
@@ -58,20 +60,28 @@ fn update(yes: bool, dry: bool) -> Result<()> {
     }
 }
 
-/// Compares the installed version with the newest on crates.io. Nothing is
-/// downloaded or written.
+/// Compares the installed version with the newest on crates.io, exiting 1
+/// when a newer one is out and 2 when crates.io could not be asked, so a
+/// script gates on the code. Nothing is downloaded or written.
 fn check() -> Result<()> {
     let current = env!("CARGO_PKG_VERSION");
-    let latest = latest()?;
+    let latest = match latest() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ck: {e}");
+            std::process::exit(2);
+        }
+    };
     if newer(&latest, current) {
-        println!("{CRATE} {latest} is out, you have {current}: run `egc self update`");
+        println!("{CRATE} {latest} is out, you have {current}: run `ck self update`");
+        std::process::exit(1);
     } else {
         println!("{CRATE} {current} is the latest release");
     }
     Ok(())
 }
 
-/// `cargo search` prints `easygocryptfs = "X.Y.Z"    # description` for an
+/// `cargo search` prints `cryptkeeper = "X.Y.Z"    # description` for an
 /// exact name match.
 fn latest() -> Result<String> {
     let Ok(out) = Command::new("cargo")

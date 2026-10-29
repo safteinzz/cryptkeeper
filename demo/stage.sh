@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
-# A staged home for the README picture. Nothing here touches your real home,
+# A staged home for the README pictures. Nothing here touches your real home,
 # your real vault list or your real vaults: every path is redirected into
 # ./home, XDG variables included.
 #
 #   ./stage.sh up     build the empty staged home
-#   ./stage.sh shell  a shell where `egc` is this build (what the tape records)
+#   ./stage.sh shell  a shell where `ck` is this build (what the tape records)
 #   ./stage.sh down   unmount anything under the stage, then delete it
 #
-# The tape makes a real vault in the stage and really mounts it, with a
-# throwaway password and a master key that dies with the stage.
+# The tapes make real vaults in the stage and really mount them, with the
+# throwaway password `demo`, master keys and an age key that die with the stage.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STAGE="$HERE/home"
 BIN="$STAGE/.bin"
-EGC="$HERE/../target/release/egc"
+# age keeps an open file's plaintext only on tmpfs, which the stage folder is
+# not, so the stage's `$XDG_RUNTIME_DIR` is a folder of its own in /dev/shm.
+RUN_DIR="/dev/shm/ck-demo-stage"
+CK="$HERE/../target/release/ck"
 
 # Written by `up`, required by `down`. See the guard further down.
-MARKER=".egc-demo-stage"
+MARKER=".ck-demo-stage"
 
 # The complete environment anything staged runs in. Used with `env -i`, so this
 # is not "the real environment plus overrides": it is everything there is.
@@ -28,6 +31,7 @@ env_for_stage() {
        "XDG_DATA_HOME=$STAGE/.local/share" \
        "XDG_STATE_HOME=$STAGE/.local/state" \
        "XDG_CACHE_HOME=$STAGE/.cache" \
+       "XDG_RUNTIME_DIR=$RUN_DIR" \
        "PATH=$BIN:/usr/local/bin:/usr/bin:/bin" \
        "TERM=${TERM:-xterm-256color}" \
        "COLORTERM=truecolor" \
@@ -36,13 +40,14 @@ env_for_stage() {
 
 up() {
   down_quiet
-  [ -x "$EGC" ] || { echo "stage.sh: no \`$EGC\`: run \`cargo build --release\` first" >&2; exit 1; }
+  [ -x "$CK" ] || { echo "stage.sh: no \`$CK\`: run \`cargo build --release\` first" >&2; exit 1; }
   mkdir -p "$STAGE"
+  mkdir -p -m 700 "$RUN_DIR"
   # Stamp it before anything else, so a later `down` can prove this tree is ours.
   : > "$STAGE/$MARKER"
   echo "staged in $STAGE"
   echo
-  echo "  ./stage.sh shell  a shell where egc is this build"
+  echo "  ./stage.sh shell  a shell where ck is this build"
   echo "  ./stage.sh down   tear it all down"
 }
 
@@ -97,6 +102,7 @@ down_quiet() {
   assert_safe_to_delete
   # --one-file-system as a second net, in case the mount check was wrong.
   rm -rf --one-file-system "$STAGE"
+  rm -rf "$RUN_DIR"
 }
 
 # ---------------------------------------------------------------------------
@@ -118,13 +124,13 @@ clear
 EOF
 }
 
-# A shell that finds this build as `egc`, so the picture shows the command you
+# A shell that finds this build as `ck`, so the picture shows the command you
 # actually type rather than a path into target/release. It starts in the
 # staged home, so the `~` in the prompt is the fixture and not your files.
 open_shell() {
   [ -f "$STAGE/$MARKER" ] || { echo "stage.sh: no stage: run \`./stage.sh up\` first" >&2; exit 1; }
   mkdir -p "$BIN"
-  ln -sf "$(cd "$(dirname "$EGC")" && pwd)/egc" "$BIN/egc"
+  ln -sf "$(cd "$(dirname "$CK")" && pwd)/ck" "$BIN/ck"
   write_demorc
   (cd "$STAGE" && env -i $(env_for_stage) \
     bash --noprofile --rcfile "$STAGE/.demorc" -i)

@@ -1,6 +1,6 @@
 [package]
 name = "cryptkeeper"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "encryption without the fuss - lock and unlock gocryptfs folders, LUKS drives and age files in one place"
